@@ -1,0 +1,10 @@
+.env
+.env.*
+.streamlit/secrets.toml
+__pycache__/
+.venv/
+venv/
+*.faiss
+*.pkl
+streamlit.log
+app.py.backup
