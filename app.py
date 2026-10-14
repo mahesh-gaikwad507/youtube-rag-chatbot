@@ -145,12 +145,28 @@ def fetch_youtube_transcript(video_id):
         headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        response = requests.get(
-            api_url,
-            params=params,
-            headers=headers,
-            timeout=60,
-        )
+     
+        response = None
+
+        # Retry once if the transcript API times out or
+        # temporarily fails to connect.
+        for attempt in range(2):
+            try:
+                response = requests.get(
+                    api_url,
+                    params=params,
+                    headers=headers,
+                    timeout=(10, 30),
+                )
+                break
+
+            except (
+                requests.Timeout,
+                requests.ConnectionError,
+            ):
+                if attempt == 1:
+                    raise
+
 
         try:
             data = response.json()
