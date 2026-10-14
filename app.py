@@ -614,7 +614,7 @@ if question:
                     retrieved_docs = (
                         st.session_state.vectorstore.similarity_search(
                             question,
-                            k=8,
+                            k=12,
                         )
                     )
 
