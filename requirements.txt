@@ -1,4 +1,5 @@
 streamlit
+requests
 youtube-transcript-api
 langchain
 langchain-community
