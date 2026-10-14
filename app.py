@@ -5,6 +5,7 @@ from urllib.parse import urlparse, parse_qs
 
 import streamlit as st
 from youtube_transcript_api import YouTubeTranscriptApi
+
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -19,641 +20,357 @@ from langchain_openrouter import ChatOpenRouter
 
 st.set_page_config(
     page_title="YouTube RAG Chatbot",
-    page_icon="🎬",
-    layout="wide"
+    page_icon="🎥",
+    layout="wide",
 )
 
 
 # --------------------------------------------------
-# DARK THEME
+# DARK THEME CSS
 # --------------------------------------------------
 
-st.markdown("""
-<style>
-.stApp {
-    background:
-        radial-gradient(ellipse at top left,
-            rgba(111, 76, 220, .18), transparent 42%),
-        linear-gradient(135deg, #0b1020, #11162b 55%, #0b1020);
-    color: #edf0ff;
-}
-[data-testid="stHeader"] {
-    background: rgba(11, 16, 32, .75);
-}
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #151a31, #0c1020);
-    border-right: 1px solid rgba(151, 130, 255, .22);
-}
-h1, h2, h3 {
-    color: #f5f3ff !important;
-    letter-spacing: -0.025em;
-}
-[data-testid="stChatMessage"] {
-    background: rgba(27, 33, 58, .78);
-    border: 1px solid rgba(139, 125, 255, .22);
-    border-radius: 18px;
-    padding: 14px 18px;
-    margin-bottom: 12px;
-}
-.stTextInput input, .stTextArea textarea {
-    background: #151b31 !important;
-    color: #f5f3ff !important;
-    border: 1px solid #48416f !important;
-    border-radius: 12px !important;
-}
-.stTextInput input:focus, .stTextArea textarea:focus {
-    border-color: #9b8aff !important;
-    box-shadow: 0 0 0 1px #9b8aff !important;
-}
-.stButton button, [data-testid="stFormSubmitButton"] button {
-    background: linear-gradient(100deg, #7657ee, #3977f6);
-    color: white;
-    border: 0;
-    border-radius: 12px;
-    font-weight: 600;
-}
-.stButton button:hover, [data-testid="stFormSubmitButton"] button:hover {
-    filter: brightness(1.12);
-    color: white;
-}
-a {
-    color: #aa9bff !important;
-}
-hr {
-    border-color: rgba(151, 130, 255, .22);
-}
-footer {
-    visibility: hidden;
-}
-</style>
-""", unsafe_allow_html=True)
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background-color: #0e1117;
+        color: #fafafa;
+    }
 
+    [data-testid="stSidebar"] {
+        background-color: #161b22;
+    }
 
-st.title("🎬 YouTube Video RAG Chatbot")
-st.caption(
-    "Ask questions about a YouTube video or uploaded transcript "
-    "and get answers grounded in the source."
+    .main-title {
+        font-size: 2.4rem;
+        font-weight: 750;
+        margin-bottom: 0.2rem;
+    }
+
+    .subtitle {
+        color: #aab4c3;
+        font-size: 1rem;
+        margin-bottom: 1.5rem;
+    }
+
+    .stTextInput input {
+        border-radius: 10px;
+    }
+
+    .stButton button {
+        border-radius: 10px;
+        font-weight: 600;
+    }
+
+    [data-testid="stChatMessage"] {
+        border-radius: 12px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
 # --------------------------------------------------
-# VIDEO URL HELPERS
+# HEADER
 # --------------------------------------------------
 
-def extract_video_id(url):
-    """Extract a YouTube video ID from a supported URL."""
-    parsed = urlparse(url.strip())
-    host = (parsed.hostname or "").lower()
+st.markdown(
+    '<div class="main-title">🎥 YouTube RAG Chatbot</div>',
+    unsafe_allow_html=True,
+)
 
-    if host == "youtu.be":
+st.markdown(
+    '<div class="subtitle">'
+    'Paste a YouTube URL and ask questions about its content.'
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+
+# --------------------------------------------------
+# VIDEO ID EXTRACTION
+# --------------------------------------------------
+
+def extract_video_id(url: str) -> str:
+    """Extract a YouTube video ID from common YouTube URL formats."""
+
+    url = url.strip()
+
+    parsed = urlparse(url)
+    hostname = parsed.netloc.lower().split(":")[0]
+
+    if hostname in {"youtu.be", "www.youtu.be"}:
         video_id = parsed.path.strip("/").split("/")[0]
-        if video_id:
-            return video_id
 
-    if host.endswith("youtube.com"):
+    elif hostname in {
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+    }:
         if parsed.path == "/watch":
-            video_id = parse_qs(parsed.query).get("v", [None])[0]
-            if video_id:
-                return video_id
+            video_id = parse_qs(parsed.query).get("v", [""])[0]
 
-        if parsed.path.startswith(("/embed/", "/shorts/")):
+        elif parsed.path.startswith(("/embed/", "/shorts/", "/live/")):
             parts = parsed.path.strip("/").split("/")
-            if len(parts) > 1 and parts[1]:
-                return parts[1]
+            video_id = parts[1] if len(parts) > 1 else ""
 
-    raise ValueError(
-        "Enter a valid YouTube URL, such as "
-        "https://www.youtube.com/watch?v=VIDEO_ID"
-    )
-
-
-# --------------------------------------------------
-# TRANSCRIPT FILE PARSING
-# --------------------------------------------------
-
-def parse_timestamp(value):
-    """Convert SRT/VTT timestamps to seconds."""
-    value = value.strip().replace(",", ".")
-    parts = value.split(":")
-
-    try:
-        if len(parts) == 3:
-            return (
-                float(parts[0]) * 3600
-                + float(parts[1]) * 60
-                + float(parts[2])
-            )
-
-        if len(parts) == 2:
-            return float(parts[0]) * 60 + float(parts[1])
-
-    except ValueError:
-        pass
-
-    raise ValueError(f"Invalid subtitle timestamp: {value}")
-
-
-def parse_uploaded_transcript(uploaded_file):
-    """
-    Parse TXT, SRT, or VTT into a list of transcript segments.
-
-    Each segment has:
-        text, start, end
-
-    TXT files do not contain timestamps, so their timestamps
-    are marked as unavailable.
-    """
-    filename = uploaded_file.name.lower()
-
-    content = uploaded_file.getvalue().decode(
-        "utf-8-sig",
-        errors="replace"
-    )
-
-    segments = []
-
-    if filename.endswith((".srt", ".vtt")):
-        # Process subtitle cues separated by blank lines.
-        content = content.replace("\r\n", "\n").replace("\r", "\n")
-
-        timestamp_pattern = re.compile(
-            r"^\s*"
-            r"(\d{1,}:\d{2}:\d{2}[.,]\d{1,3}"
-            r"|\d{1,}:\d{2}[.,]\d{1,3})"
-            r"\s*-->\s*"
-            r"(\d{1,}:\d{2}:\d{2}[.,]\d{1,3}"
-            r"|\d{1,}:\d{2}[.,]\d{1,3})"
-        )
-
-        for block in re.split(r"\n\s*\n", content.strip()):
-            lines = block.splitlines()
-
-            timestamp_index = None
-            timestamp_match = None
-
-            for index, line in enumerate(lines):
-                match = timestamp_pattern.match(line)
-                if match:
-                    timestamp_index = index
-                    timestamp_match = match
-                    break
-
-            if timestamp_match is None:
-                continue
-
-            start = parse_timestamp(timestamp_match.group(1))
-            end = parse_timestamp(timestamp_match.group(2))
-
-            # Everything after the timestamp line is subtitle text.
-            text_lines = lines[timestamp_index + 1:]
-
-            text = " ".join(text_lines)
-
-            # Remove common HTML subtitle formatting tags.
-            text = re.sub(r"<[^>]+>", "", text)
-            text = re.sub(r"\{\\[^}]+\}", "", text)
-            text = re.sub(r"\s+", " ", text).strip()
-
-            if text:
-                segments.append({
-                    "text": text,
-                    "start": start,
-                    "end": max(start, end),
-                    "has_timestamps": True
-                })
-
-        if not segments:
-            raise ValueError(
-                "No valid subtitle cues were found. "
-                "Please check that the SRT/VTT file contains "
-                "timestamps and subtitle text."
-            )
-
-    elif filename.endswith(".txt"):
-        # TXT has no dependable timing information.
-        text = re.sub(r"\s+", " ", content).strip()
-
-        if not text:
-            raise ValueError("The uploaded text file is empty.")
-
-        segments.append({
-            "text": text,
-            "start": 0.0,
-            "end": 0.0,
-            "has_timestamps": False
-        })
+        else:
+            video_id = ""
 
     else:
+        video_id = ""
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
         raise ValueError(
-            "Unsupported file format. Upload TXT, SRT, or VTT."
+            "Invalid YouTube URL. Please paste a valid YouTube video link."
         )
 
-    return segments
+    return video_id
 
 
 # --------------------------------------------------
-# EMBEDDINGS
+# EMBEDDING MODEL
 # --------------------------------------------------
 
-@st.cache_resource(show_spinner="Loading multilingual embedding model...")
+@st.cache_resource(show_spinner="Loading embedding model...")
 def get_embeddings():
     return HuggingFaceEmbeddings(
-        model_name=(
-            "sentence-transformers/"
-            "paraphrase-multilingual-MiniLM-L12-v2"
-        )
+        model_name="sentence-transformers/"
+                    "paraphrase-multilingual-MiniLM-L12-v2"
     )
 
 
 # --------------------------------------------------
-# SHARED FAISS INDEXING PIPELINE
+# FETCH YOUTUBE TRANSCRIPT
 # --------------------------------------------------
 
-def build_index_from_segments(
-    segments,
-    video_id=None,
-    source_name="Uploaded transcript"
-):
+def fetch_youtube_transcript(video_id: str):
     """
-    Shared indexing pipeline for both YouTube captions
-    and uploaded transcript files.
+    Fetch a publicly accessible YouTube transcript.
 
-    Keeps the existing chunking, embeddings and FAISS approach.
+    This uses youtube-transcript-api. YouTube may block requests
+    originating from cloud-hosted servers, including Streamlit Cloud.
     """
-    if not segments:
-        raise ValueError("No transcript segments were provided.")
-
-    full_text = ""
-    spans = []
-
-    has_timestamps = all(
-        segment.get("has_timestamps", True)
-        for segment in segments
-    )
-
-    for segment in segments:
-        text = segment["text"].strip()
-
-        if not text:
-            continue
-
-        if full_text:
-            full_text += " "
-
-        start_char = len(full_text)
-        full_text += text
-        end_char = len(full_text)
-
-        spans.append({
-            "start_char": start_char,
-            "end_char": end_char,
-            "start": float(segment.get("start", 0.0)),
-            "end": float(segment.get("end", 0.0))
-        })
-
-    if not full_text.strip():
-        raise ValueError("The transcript contains no usable text.")
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=150,
-        add_start_index=True
-    )
-
-    raw_docs = splitter.create_documents(
-        [full_text],
-        metadatas=[{
-            "video_id": video_id or "",
-            "source_name": source_name
-        }]
-    )
-
-    chunks = []
-
-    for doc in raw_docs:
-        chunk_start = doc.metadata["start_index"]
-        chunk_end = chunk_start + len(doc.page_content)
-
-        overlapping = [
-            segment for segment in spans
-            if segment["start_char"] < chunk_end
-            and segment["end_char"] > chunk_start
-        ]
-
-        if not overlapping:
-            continue
-
-        metadata = {
-            "video_id": video_id or "",
-            "source_name": source_name,
-            "has_timestamps": has_timestamps,
-            "chunk_index": len(chunks)
-        }
-
-        if has_timestamps:
-            metadata["start_seconds"] = overlapping[0]["start"]
-            metadata["end_seconds"] = overlapping[-1]["end"]
-        else:
-            metadata["start_seconds"] = 0.0
-            metadata["end_seconds"] = 0.0
-
-        chunks.append(
-            Document(
-                page_content=doc.page_content,
-                metadata=metadata
-            )
-        )
-
-    if not chunks:
-        raise ValueError("Could not create transcript chunks.")
-
-    embeddings = get_embeddings()
-
-    vectorstore = FAISS.from_documents(
-        chunks,
-        embeddings
-    )
-
-    return vectorstore, len(segments), has_timestamps
-
-
-# --------------------------------------------------
-# YOUTUBE TRANSCRIPT FETCHING
-# --------------------------------------------------
-
-def build_index_from_youtube(video_url):
-    """
-    Retrieve captions from YouTube, then use the shared
-    chunking, embedding and FAISS pipeline.
-    """
-    video_id = extract_video_id(video_url)
 
     api = YouTubeTranscriptApi()
+
     transcript_list = api.list(video_id)
-    available = list(transcript_list)
+    available_transcripts = list(transcript_list)
 
-    if not available:
-        raise ValueError("No accessible transcripts were found.")
+    if not available_transcripts:
+        raise RuntimeError(
+            "No transcripts are available for this video."
+        )
 
-    # Prefer English, then Hindi, then the first available language.
+    # Prefer English, then Hindi, then another available language.
     chosen = next(
-        (track for track in available
-         if track.language_code == "en"),
-        None
+        (
+            transcript
+            for transcript in available_transcripts
+            if transcript.language_code == "en"
+        ),
+        None,
     )
 
     if chosen is None:
         chosen = next(
-            (track for track in available
-             if track.language_code == "hi"),
-            available[0]
+            (
+                transcript
+                for transcript in available_transcripts
+                if transcript.language_code == "hi"
+            ),
+            available_transcripts[0],
         )
 
-    transcript_data = chosen.fetch()
+    fetched = chosen.fetch()
 
     segments = []
 
-    for item in transcript_data:
+    for item in fetched:
         text = item.text.strip()
 
-        if text:
-            segments.append({
+        if not text:
+            continue
+
+        start = float(item.start)
+        duration = float(item.duration)
+
+        segments.append(
+            {
                 "text": text,
-                "start": float(item.start),
-                "end": float(item.start + item.duration),
-                "has_timestamps": True
-            })
+                "start": start,
+                "end": start + duration,
+            }
+        )
 
     if not segments:
-        raise ValueError("The YouTube transcript is empty.")
-
-    vectorstore, segment_count, has_timestamps = (
-        build_index_from_segments(
-            segments,
-            video_id=video_id,
-            source_name="YouTube transcript"
-        )
-    )
-
-    return (
-        video_id,
-        chosen.language,
-        segment_count,
-        vectorstore,
-        has_timestamps
-    )
-
-
-# --------------------------------------------------
-# SOURCE DISPLAY HELPERS
-# --------------------------------------------------
-
-def format_time(seconds):
-    seconds = int(max(0, seconds))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-    return f"{minutes:02d}:{seconds:02d}"
-
-
-def display_sources(sources):
-    with st.expander("View transcript sources"):
-        for index, source in enumerate(sources, start=1):
-            if source.get("url"):
-                st.markdown(
-                    f"**Source {index}:** "
-                    f"[▶ {source['start_label']}–"
-                    f"{source['end_label']}]({source['url']})"
-                )
-            else:
-                st.markdown(
-                    f"**Source {index}:** "
-                    f"{source.get('source_name', 'Uploaded transcript')}"
-                )
-
-                if not source.get("has_timestamps", False):
-                    st.caption("No timestamps were available in this TXT file.")
-
-            st.write(source["text"])
-
-
-# --------------------------------------------------
-# API KEY
-# --------------------------------------------------
-
-api_key = os.environ.get("OPENROUTER_API_KEY")
-
-if not api_key:
-    st.error(
-        "OPENROUTER_API_KEY is missing. Add it to your "
-        "Streamlit app's Secrets settings."
-    )
-    st.stop()
-
-
-# --------------------------------------------------
-# SIDEBAR: TRANSCRIPT SOURCE
-# --------------------------------------------------
-
-with st.sidebar:
-    st.header("Video settings")
-
-    video_url = st.text_input(
-        "YouTube URL",
-        placeholder="https://www.youtube.com/watch?v=..."
-    )
-
-    st.markdown("---")
-
-    st.subheader("Or upload a transcript")
-
-    uploaded_file = st.file_uploader(
-        "Choose TXT, SRT, or VTT",
-        type=["txt", "srt", "vtt"],
-        help=(
-            "Use an exported transcript if YouTube blocks "
-            "automatic caption retrieval."
-        )
-    )
-
-    st.caption(
-        "If a file is uploaded, it takes priority over the YouTube URL."
-    )
-
-    index_clicked = st.button(
-        "Build index",
-        type="primary",
-        use_container_width=True
-    )
-
-    st.caption(
-        "The first run may download the multilingual embedding model."
-    )
-
-
-# --------------------------------------------------
-# INDEX THE SELECTED SOURCE
-# --------------------------------------------------
-
-if index_clicked:
-    if uploaded_file is None and not video_url.strip():
-        st.warning(
-            "Enter a YouTube URL or upload a transcript file."
+        raise RuntimeError(
+            "The transcript was empty. Try another video."
         )
 
-    else:
+    return segments, chosen.language_code
+
+
+# --------------------------------------------------
+# BUILD FAISS VECTOR INDEX
+# --------------------------------------------------
+
+def build_index(video_url: str):
+    video_id = extract_video_id(video_url)
+
+    segments, language = fetch_youtube_transcript(video_id)
+
+    # Combine transcript while preserving character offsets.
+    full_text_parts = []
+    segment_ranges = []
+    current_position = 0
+
+    for segment in segments:
+        text = segment["text"]
+
+        start_position = current_position
+        end_position = start_position + len(text)
+
+        segment_ranges.append(
+            {
+                "char_start": start_position,
+                "char_end": end_position,
+                "start": segment["start"],
+                "end": segment["end"],
+            }
+        )
+
+        full_text_parts.append(text)
+        current_position = end_position + 1
+
+    full_text = " ".join(full_text_parts)
+
+    # Split transcript into overlapping chunks.
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=150,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+
+    text_chunks = splitter.split_text(full_text)
+
+    if not text_chunks:
+        raise RuntimeError(
+            "Could not create text chunks from this transcript."
+        )
+
+    documents = []
+    search_position = 0
+
+    for index, chunk in enumerate(text_chunks):
+        # Locate this chunk in the original combined transcript.
+        chunk_start = full_text.find(chunk, search_position)
+
+        if chunk_start == -1:
+            chunk_start = full_text.find(chunk)
+
+        if chunk_start == -1:
+            chunk_start = 0
+
+        chunk_end = chunk_start + len(chunk)
+        search_position = chunk_start + max(1, len(chunk) - 150)
+
+        # Find transcript segments overlapping this chunk.
+        overlapping = [
+            segment
+            for segment in segment_ranges
+            if (
+                segment["char_end"] >= chunk_start
+                and segment["char_start"] <= chunk_end
+            )
+        ]
+
+        if overlapping:
+            start_seconds = overlapping[0]["start"]
+            end_seconds = overlapping[-1]["end"]
+        else:
+            start_seconds = 0.0
+            end_seconds = 0.0
+
+        documents.append(
+            Document(
+                page_content=chunk,
+                metadata={
+                    "video_id": video_id,
+                    "chunk_index": index,
+                    "start_seconds": int(start_seconds),
+                    "end_seconds": int(end_seconds),
+                    "language": language,
+                },
+            )
+        )
+
+    embeddings = get_embeddings()
+
+    vectorstore = FAISS.from_documents(
+        documents=documents,
+        embedding=embeddings,
+    )
+
+    return {
+        "video_id": video_id,
+        "language": language,
+        "segment_count": len(segments),
+        "chunk_count": len(documents),
+        "vectorstore": vectorstore,
+        "video_url": (
+            f"https://www.youtube.com/watch?v={video_id}"
+        ),
+    }
+
+
+# --------------------------------------------------
+# OPENROUTER LLM
+# --------------------------------------------------
+
+def get_llm():
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+
+    if not api_key:
         try:
-            with st.spinner(
-                "Processing transcript and building FAISS index..."
-            ):
-                if uploaded_file is not None:
-                    # Upload takes priority over the URL.
-                    segments = parse_uploaded_transcript(uploaded_file)
+            api_key = st.secrets.get("OPENROUTER_API_KEY")
+        except Exception:
+            api_key = None
 
-                    vectorstore, segment_count, has_timestamps = (
-                        build_index_from_segments(
-                            segments,
-                            video_id=None,
-                            source_name=uploaded_file.name
-                        )
-                    )
-
-                    source_type = "upload"
-                    source_video_id = None
-                    source_language = "From uploaded file"
-                    indexed_source_name = uploaded_file.name
-
-                else:
-                    (
-                        source_video_id,
-                        source_language,
-                        segment_count,
-                        vectorstore,
-                        has_timestamps
-                    ) = build_index_from_youtube(video_url)
-
-                    source_type = "youtube"
-                    indexed_source_name = video_url.strip()
-
-            # Store all index information in the current session.
-            st.session_state.vectorstore = vectorstore
-            st.session_state.video_id = source_video_id
-            st.session_state.source_type = source_type
-            st.session_state.source_name = indexed_source_name
-            st.session_state.language = source_language
-            st.session_state.segment_count = segment_count
-            st.session_state.has_timestamps = has_timestamps
-            st.session_state.indexed_url = (
-                video_url.strip() if source_type == "youtube" else ""
-            )
-
-            # Start a fresh chat for the newly indexed source.
-            st.session_state.messages = []
-
-            st.success("Transcript indexed successfully!")
-
-        except Exception as e:
-            st.error("Could not index this source.")
-            st.caption(
-                f"Error details: {type(e).__name__}: {e}"
-            )
-
-
-# --------------------------------------------------
-# CHAT INTERFACE
-# --------------------------------------------------
-
-if "vectorstore" in st.session_state:
-    source_type = st.session_state.source_type
-    video_id = st.session_state.video_id
-
-    st.success(
-        f"Indexed source: {st.session_state.source_name} · "
-        f"Source type: {source_type} · "
-        f"Segments: {st.session_state.segment_count}"
-    )
-
-    if (
-        source_type == "youtube"
-        and video_id
-    ):
-        st.markdown(
-            f"[▶ Open YouTube video]"
-            f"(https://www.youtube.com/watch?v={video_id})"
+    if not api_key:
+        raise RuntimeError(
+            "OpenRouter API key is missing. Add "
+            "OPENROUTER_API_KEY to your Streamlit secrets."
         )
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    # Keep the existing OpenRouter model.
-    llm = ChatOpenRouter(
+    return ChatOpenRouter(
         model="openai/gpt-4o-mini",
         api_key=api_key,
-        temperature=0
+        temperature=0,
     )
 
-    prompt_template = ChatPromptTemplate.from_template("""
-You are an intelligent assistant for a video or transcript.
 
-Answer the user's question using only the supplied transcript context.
+# --------------------------------------------------
+# PROMPT TEMPLATE
+# --------------------------------------------------
+
+prompt = ChatPromptTemplate.from_template(
+    """
+You are a helpful assistant that answers questions about a
+YouTube video's transcript.
+
+Answer the user's question using ONLY the transcript context below.
 
 Instructions:
-- For summary or purpose questions, explain the main topic,
-  purpose, and key takeaways supported by the context.
-- For speaker questions, use explicit names, introductions,
-  or roles in the transcript. Never guess a person's identity.
-- If the speaker's name is not available, say that the transcript
-  does not identify the speaker.
-- Understand the meaning of the question, including paraphrases.
-- If only part of an answer is supported, answer that part and
-  explain what remains unknown.
-- Never invent facts or timestamps.
-- Answer in the language used by the user.
-- Cite relevant transcript timestamps in your answer when provided.
-- If the source has no timestamps, do not invent any.
+1. Give a clear, direct answer.
+2. Do not invent facts that are absent from the transcript.
+3. If the answer is not in the provided context, say:
+   "I couldn't find that information in the available transcript."
+4. Use bullet points when they improve readability.
+5. Do not claim to have watched video scenes; you are using its transcript.
+6. Keep your answer relevant to the user's question.
 
 Transcript context:
 {context}
@@ -662,106 +379,295 @@ User question:
 {question}
 
 Answer:
-""")
+"""
+)
 
-    # Display conversation history.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
 
-            if message.get("sources"):
-                display_sources(message["sources"])
+# --------------------------------------------------
+# SOURCE DISPLAY
+# --------------------------------------------------
 
-    question = st.chat_input(
-        "Ask a question about this transcript..."
+def display_sources(documents, video_id):
+    st.markdown("#### 📚 Sources")
+
+    seen = set()
+
+    for document in documents:
+        metadata = document.metadata
+
+        start = int(metadata.get("start_seconds", 0))
+        end = int(metadata.get("end_seconds", 0))
+
+        key = (start, end, document.page_content[:80])
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        timestamp_url = (
+            f"https://www.youtube.com/watch?v={video_id}&t={start}s"
+        )
+
+        with st.expander(
+            f"▶️ Transcript source — {start}s to {end}s"
+        ):
+            st.markdown(
+                f"[Open video at this timestamp]({timestamp_url})"
+            )
+            st.write(document.page_content)
+
+
+# --------------------------------------------------
+# SIDEBAR: URL INPUT ONLY
+# --------------------------------------------------
+
+with st.sidebar:
+    st.header("🎬 Video Input")
+
+    video_url = st.text_input(
+        "Paste YouTube video URL",
+        placeholder="https://www.youtube.com/watch?v=...",
+        help="Paste a public YouTube video link with an available transcript.",
     )
 
-    if question:
-        st.session_state.messages.append({
-            "role": "user",
-            "content": question
-        })
+    process_button = st.button(
+        "Process Video",
+        type="primary",
+        use_container_width=True,
+    )
+
+    st.divider()
+
+    st.caption("How to use")
+    st.markdown(
+        """
+        1. Paste a YouTube video URL.
+        2. Click **Process Video**.
+        3. Wait for indexing to finish.
+        4. Ask questions in the chat.
+        """
+    )
+
+
+# --------------------------------------------------
+# SESSION STATE
+# --------------------------------------------------
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+
+if "video_id" not in st.session_state:
+    st.session_state.video_id = None
+
+if "video_url" not in st.session_state:
+    st.session_state.video_url = None
+
+if "video_language" not in st.session_state:
+    st.session_state.video_language = None
+
+if "segment_count" not in st.session_state:
+    st.session_state.segment_count = 0
+
+if "chunk_count" not in st.session_state:
+    st.session_state.chunk_count = 0
+
+
+# --------------------------------------------------
+# PROCESS VIDEO
+# --------------------------------------------------
+
+if process_button:
+    if not video_url.strip():
+        st.sidebar.warning("Please paste a YouTube URL.")
+
+    else:
+        try:
+            # Validate before attempting transcript retrieval.
+            new_video_id = extract_video_id(video_url)
+
+            with st.spinner(
+                "Fetching transcript and building the search index..."
+            ):
+                result = build_index(video_url)
+
+            # Update state only after successful indexing.
+            st.session_state.vectorstore = result["vectorstore"]
+            st.session_state.video_id = result["video_id"]
+            st.session_state.video_url = result["video_url"]
+            st.session_state.video_language = result["language"]
+            st.session_state.segment_count = result["segment_count"]
+            st.session_state.chunk_count = result["chunk_count"]
+            st.session_state.messages = []
+
+            st.success("Video processed successfully!")
+
+        except Exception as error:
+            error_text = str(error)
+            lower_error = error_text.lower()
+
+            if (
+                "requestblocked" in lower_error
+                or "ipblocked" in lower_error
+                or "blocking requests" in lower_error
+            ):
+                st.error(
+                    "YouTube has blocked transcript requests from "
+                    "the app's hosting environment. This is a "
+                    "server-side restriction, not an invalid URL. "
+                    "Try again later or use a transcript retrieval "
+                    "service that permits server-side access."
+                )
+            elif (
+                "no transcripts" in lower_error
+                or "transcripts are disabled" in lower_error
+                or "disabled" in lower_error
+            ):
+                st.error(
+                    "A usable transcript may not be available for "
+                    "this video. Try a video with captions enabled."
+                )
+            else:
+                st.error(f"Could not process this video: {error_text}")
+
+
+# --------------------------------------------------
+# VIDEO DETAILS
+# --------------------------------------------------
+
+if st.session_state.vectorstore is not None:
+    st.success("✅ Video indexed and ready for questions.")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric("Transcript segments", st.session_state.segment_count)
+
+    with col2:
+        st.metric("Search chunks", st.session_state.chunk_count)
+
+    with col3:
+        st.metric("Transcript language", st.session_state.video_language)
+
+    st.video(st.session_state.video_url)
+
+    st.divider()
+
+
+# --------------------------------------------------
+# CHAT HISTORY
+# --------------------------------------------------
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+        if message["role"] == "assistant" and message.get("sources"):
+            with st.expander("📚 View sources"):
+                for source in message["sources"]:
+                    start = source["start"]
+                    end = source["end"]
+                    source_text = source["text"]
+
+                    source_url = (
+                        f"https://www.youtube.com/watch?v="
+                        f"{st.session_state.video_id}&t={start}s"
+                    )
+
+                    st.markdown(
+                        f"[▶️ Open at {start}s–{end}s]({source_url})"
+                    )
+                    st.caption(source_text)
+
+
+# --------------------------------------------------
+# CHAT INPUT
+# --------------------------------------------------
+
+question = st.chat_input(
+    "Ask a question about the processed video..."
+)
+
+if question:
+    if st.session_state.vectorstore is None:
+        st.warning(
+            "Please paste a YouTube URL and process the video first."
+        )
+
+    else:
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": question,
+            }
+        )
 
         with st.chat_message("user"):
             st.markdown(question)
 
         with st.chat_message("assistant"):
             try:
-                with st.spinner("Searching transcript..."):
-                    docs = st.session_state.vectorstore.similarity_search(
-                        question,
-                        k=8
+                with st.spinner("Searching the transcript..."):
+                    retrieved_docs = (
+                        st.session_state.vectorstore.similarity_search(
+                            question,
+                            k=8,
+                        )
                     )
 
-                    context_parts = []
-                    sources = []
+                    context = "\n\n".join(
+                        document.page_content
+                        for document in retrieved_docs
+                    )
 
-                    for doc in docs:
-                        metadata = doc.metadata
-                        text = doc.page_content
+                with st.spinner("Generating answer..."):
+                    llm = get_llm()
 
-                        has_timestamps = metadata.get(
-                            "has_timestamps", True
-                        )
+                    chain = prompt | llm
 
-                        start = int(
-                            metadata.get("start_seconds", 0)
-                        )
-                        end = int(
-                            metadata.get("end_seconds", 0)
-                        )
+                    response = chain.invoke(
+                        {
+                            "context": context,
+                            "question": question,
+                        }
+                    )
 
-                        if has_timestamps:
-                            context_parts.append(
-                                f"[{start}s–{end}s]\n{text}"
-                            )
-                        else:
-                            context_parts.append(text)
+                    answer = response.content
 
-                        source_url = None
+                st.markdown(answer)
 
-                        if (
-                            source_type == "youtube"
-                            and video_id
-                            and has_timestamps
-                        ):
-                            source_url = (
-                                "https://www.youtube.com/watch"
-                                f"?v={video_id}&t={start}s"
-                            )
+                source_data = []
 
-                        sources.append({
-                            "start_label": format_time(start),
-                            "end_label": format_time(end),
-                            "url": source_url,
-                            "text": text,
-                            "has_timestamps": has_timestamps,
-                            "source_name": metadata.get(
-                                "source_name",
-                                st.session_state.source_name
-                            )
-                        })
+                for document in retrieved_docs:
+                    metadata = document.metadata
 
-                    chain = prompt_template | llm
+                    source_data.append(
+                        {
+                            "start": int(
+                                metadata.get("start_seconds", 0)
+                            ),
+                            "end": int(
+                                metadata.get("end_seconds", 0)
+                            ),
+                            "text": document.page_content,
+                        }
+                    )
 
-                    result = chain.invoke({
-                        "context": "\n\n".join(context_parts),
-                        "question": question
-                    })
+                display_sources(
+                    retrieved_docs,
+                    st.session_state.video_id,
+                )
 
-                    answer = result.content
-
-                    st.markdown(answer)
-                    display_sources(sources)
-
-                    st.session_state.messages.append({
+                st.session_state.messages.append(
+                    {
                         "role": "assistant",
                         "content": answer,
-                        "sources": sources
-                    })
-
-            except Exception as e:
-                st.error(
-                    f"Could not generate answer: "
-                    f"{type(e).__name__}: {e}"
+                        "sources": source_data,
+                    }
                 )
+
+            except Exception as error:
+                st.error(f"Something went wrong: {error}")
